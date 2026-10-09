@@ -130,10 +130,10 @@ def generar_pdf(datos: Datos, recat: str, categoria_meta: str | None = None) -> 
 
     # Objetivo
     el.append(Paragraph(
-        f"Objetivo hacia la próxima recategorización ({_mes_lindo(ob['recat_proxima'])}) "
+        f"Objetivo para la recategorización ({_mes_lindo(ob['recat'])}) "
         f"— Categoría meta: {ob['categoria_meta']}", ST_H2))
     filas = [
-        ["Ya facturado en la nueva ventana", fmt_ars(ob["ya_facturado"])],
+        ["Ya facturado en esta ventana", fmt_ars(ob["ya_facturado"])],
         ["Tope actual de la categoría meta", fmt_ars(ob["tope_actual"])],
         ["Inflación estimada del semestre", fmt_pct(ob["inflacion_estimada_semestre"])],
         ["Tope proyectado (ajustado por inflación)", fmt_ars(ob["tope_proyectado"])],

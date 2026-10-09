@@ -87,11 +87,34 @@ def inflacion_compuesta(tasas: list[float]) -> float:
     return acc - 1.0
 
 
+def total_mes(facturas: list[float] | None) -> float | None:
+    """Suma de las facturas cargadas en el mes, o None si no hay ninguna cargada."""
+    if not facturas:
+        return None
+    return sum(facturas)
+
+
+def parse_facturas(texto: str) -> list[float]:
+    """Convierte 'monto1 + monto2 + ...' en la lista de montos de cada factura.
+
+    Lanza ValueError si alguna parte no es un número.
+    """
+    partes = [p.strip() for p in texto.split("+")]
+    return [float(p) for p in partes if p]
+
+
+def fmt_facturas(montos: list[float]) -> str:
+    """Serializa una lista de montos como 'm1 + m2 + ...' para edición (inversa de parse_facturas)."""
+    def _num(v: float) -> str:
+        return str(int(v)) if v == int(v) else str(v)
+    return " + ".join(_num(v) for v in montos)
+
+
 # ------------------------------------------------------------------- modelo
 @dataclass
 class Datos:
     """Contenedor de datos persistidos en JSON."""
-    facturacion: dict[str, float] = field(default_factory=dict)   # 'YYYY-MM' -> $
+    facturacion: dict[str, list[float]] = field(default_factory=dict)  # 'YYYY-MM' -> [monto de cada factura]
     inflacion: dict[str, float] = field(default_factory=dict)     # 'YYYY-MM' -> tasa (0.02 = 2%)
     inflacion_estimada: dict[str, float] = field(default_factory=dict)  # estimaciones propias
     escalas: dict[str, dict[str, float]] = field(default_factory=dict)  # 'YYYY-MM' vigencia -> {cat: tope}
@@ -107,7 +130,10 @@ class Datos:
         with open(path, encoding="utf-8") as f:
             raw = json.load(f)
         return cls(
-            facturacion={k: float(v) for k, v in raw.get("facturacion", {}).items()},
+            facturacion={
+                k: ([float(x) for x in v] if isinstance(v, list) else [float(v)])
+                for k, v in raw.get("facturacion", {}).items()
+            },
             inflacion={k: float(v) for k, v in raw.get("inflacion", {}).items()},
             inflacion_estimada={k: float(v) for k, v in raw.get("inflacion_estimada", {}).items()},
             escalas={k: {c: float(t) for c, t in v.items()} for k, v in raw.get("escalas", {}).items()},
@@ -144,6 +170,59 @@ class Datos:
         vig = max(candidatas)
         return vig, self.escalas[vig]
 
+    def escala_estimada(self, recat: str) -> tuple[str, dict[str, float], bool] | tuple[None, None, None]:
+        """Escala aplicable a `recat`, extrapolando si no hay una cargada.
+
+        - Si hay una escala con vigencia == recat, se devuelve tal cual
+          (es_estimada=False).
+        - Si `recat` es anterior a la primera vigencia cargada, se deflacta
+          esa primera escala semestre a semestre (con la inflación real, o
+          la estimada si falta) hasta llegar a `recat`.
+        - Si `recat` es posterior a la última vigencia cargada, se actualiza
+          esa última escala semestre a semestre (con la inflación proyectada
+          de cada tramo futuro) hasta `recat`.
+
+        Devuelve (vigencia_base, escala, es_estimada). (None, None, None) si
+        no hay ninguna escala cargada, o si falta algún dato de inflación en
+        el camino y no se puede estimar.
+        """
+        if not self.escalas:
+            return None, None, None
+        if recat in self.escalas:
+            return recat, self.escalas[recat], False
+
+        vigencias = sorted(self.escalas)
+        primera, ultima = vigencias[0], vigencias[-1]
+
+        if recat < primera:
+            escala = dict(self.escalas[primera])
+            paso = primera
+            while paso > recat:
+                tasas_ok = [t for t in (self.tasa_mes(m) for m in semestre_previo(paso)) if t is not None]
+                if not tasas_ok:
+                    return None, None, None
+                infl = inflacion_compuesta(tasas_ok)
+                escala = {cat: v / (1.0 + infl) for cat, v in escala.items()}
+                paso = recat_anterior(paso)
+            return primera, escala, True
+
+        if recat > ultima:
+            escala = dict(self.escalas[ultima])
+            paso = ultima
+            while paso < recat:
+                paso = recat_siguiente(paso)
+                tasas_ok = [t for t in (self.tasa_mes(m) for m in semestre_previo(paso)) if t is not None]
+                if not tasas_ok:
+                    return None, None, None
+                infl = inflacion_compuesta(tasas_ok)
+                escala = {cat: v * (1.0 + infl) for cat, v in escala.items()}
+            return ultima, escala, True
+
+        # 'recat' cae entre dos vigencias conocidas (no debería pasar con
+        # recats semestrales estándar); se usa la vigente normal.
+        vig, esc = self.escala_vigente(recat)
+        return vig, esc, False
+
 
 # ----------------------------------------------------------------- cálculo
 def categoria_para(total_anual: float, escala: dict[str, float]) -> str | None:
@@ -157,7 +236,7 @@ def categoria_para(total_anual: float, escala: dict[str, float]) -> str | None:
 def analizar_recat(datos: Datos, recat: str) -> dict:
     """Análisis completo de una recategorización (réplica del bloque del Excel)."""
     meses = ventana_12m(recat)
-    fact = {m: datos.facturacion.get(m) for m in meses}
+    fact = {m: total_mes(datos.facturacion.get(m)) for m in meses}
     total = sum(v for v in fact.values() if v is not None)
     n_cargados = sum(1 for v in fact.values() if v is not None)
 
@@ -171,14 +250,14 @@ def analizar_recat(datos: Datos, recat: str) -> dict:
     # Comparación vs recategorización anterior
     prev = recat_anterior(recat)
     meses_prev = ventana_12m(prev)
-    total_prev = sum(datos.facturacion.get(m, 0.0) or 0.0 for m in meses_prev)
+    total_prev = sum(total_mes(datos.facturacion.get(m)) or 0.0 for m in meses_prev)
     aumento_nominal = (total / total_prev - 1.0) if total_prev else None
     # VAN: total actual deflactado a moneda del semestre anterior (como C20 = C15/(1+C17))
     van = total / (1.0 + infl_6m) if infl_6m is not None else None
     variacion_real = (van / total_prev - 1.0) if (van is not None and total_prev) else None
 
-    # Categoría según escala vigente
-    vig, escala = datos.escala_vigente(recat)
+    # Categoría según escala vigente (o extrapolada si no hay una cargada)
+    vig, escala, escala_estimada = datos.escala_estimada(recat)
     cat = categoria_para(total, escala) if escala else None
 
     return {
@@ -196,50 +275,104 @@ def analizar_recat(datos: Datos, recat: str) -> dict:
         "variacion_real": variacion_real,
         "escala_vigencia": vig,
         "escala": escala,
+        "escala_estimada": escala_estimada,
         "categoria": cat,
     }
 
 
-def objetivo(datos: Datos, recat: str, categoria_meta: str | None = None) -> dict:
-    """Objetivo de facturación hasta la próxima recategorización.
+def serie_historica(datos: Datos, hasta_recat: str) -> list[dict]:
+    """Análisis de cada recategorización con datos, desde la primera disponible
+    hasta `hasta_recat` inclusive, para ver cómo varió la facturación.
 
-    - tope_actual: tope de la categoría meta con la escala vigente hoy.
-    - tope_proyectado: ese tope ajustado por la inflación estimada del
-      semestre en curso (las escalas de ARCA se actualizan por IPC), como
-      hace el Excel en E20 = E15*(1+inf).
-    - margen: cuánto se puede facturar en los meses que restan de la ventana
-      móvil sin superar el tope (nominal y proyectado).
+    Agrega a cada resultado de `analizar_recat`:
+    - factor_a_hoy: factor de inflación compuesta para llevar el total de esa
+      recategorización a pesos de `hasta_recat` (encadenando la inflación
+      semestral de cada recategorización posterior). None si falta algún
+      dato de inflación en el camino.
+    - total_actualizado: total * factor_a_hoy, comparable entre sí porque
+      queda expresado en la misma moneda (la de `hasta_recat`).
+    """
+    if not datos.facturacion:
+        return []
+    primero = min(datos.facturacion)
+    a0 = int(primero[:4])
+    recats = []
+    for a in range(a0, int(hasta_recat[:4]) + 1):
+        for m in (1, 7):
+            r = mes_key(a, m)
+            if mes_key(a0, 7) <= r <= hasta_recat:
+                recats.append(r)
+    resultados = [analizar_recat(datos, r) for r in recats]
+
+    factor = 1.0
+    for res in reversed(resultados):
+        res["factor_a_hoy"] = factor
+        infl = res["inflacion_6m"]
+        factor = factor * (1.0 + infl) if (factor is not None and infl is not None) else None
+
+    for res in resultados:
+        f = res["factor_a_hoy"]
+        res["total_actualizado"] = res["total"] * f if f is not None else None
+
+    return resultados
+
+
+def objetivo(datos: Datos, recat: str, categoria_meta: str | None = None,
+             hoy: date | None = None) -> dict:
+    """Objetivo de facturación para la recategorización `recat`.
+
+    Trabaja sobre la ventana de 12 meses que computa para `recat` (la misma
+    que analiza `analizar_recat`), no sobre la de la recategorización
+    siguiente: lo que interesa es cuánto más se puede facturar sin pasarse
+    del tope de la categoría meta en *esta* recategorización.
+
+    - ya_facturado: todo lo que ya va a computar para `recat`. Los meses de
+      la ventana ya transcurridos (hasta el mes corriente inclusive) valen lo
+      facturado, o $0 si no se cargó nada.
+    - meses_restantes: los meses de la ventana que todavía no ocurrieron y no
+      tienen facturación cargada. Son los únicos sobre los que se puede
+      repartir el margen disponible.
+    - tope_actual: tope de la categoría meta con la última escala publicada
+      que le sea aplicable.
+    - tope_proyectado: el tope que va a regir en `recat`. Si ARCA todavía no
+      publicó esa escala, se proyecta la última conocida por la inflación de
+      los semestres que faltan (las escalas se actualizan por IPC).
     """
     cat = categoria_meta or datos.categoria_meta
-    prox = recat_siguiente(recat)
-    meses_prox = ventana_12m(prox)
-    facturado = {m: datos.facturacion.get(m) for m in meses_prox}
+    hoy = hoy or date.today()
+    mes_actual = mes_key(hoy.year, hoy.month)
+
+    meses_ventana = ventana_12m(recat)
+    facturado = {m: total_mes(datos.facturacion.get(m)) for m in meses_ventana}
     ya_facturado = sum(v for v in facturado.values() if v is not None)
-    meses_restantes = [m for m, v in facturado.items() if v is None]
+    meses_restantes = [m for m, v in facturado.items() if v is None and m > mes_actual]
 
     vig, escala = datos.escala_vigente(recat)
     tope_actual = escala.get(cat) if escala else None
 
-    # Inflación estimada del semestre que define la próxima actualización de escala
-    sem = semestre_previo(prox)
-    tasas = [datos.tasa_mes(m) for m in sem]
-    tasas_ok = [t for t in tasas if t is not None]
+    # Tope vigente en `recat`: el oficial si ya se publicó, o el proyectado
+    # por inflación desde la última escala conocida.
+    _, escala_proy, tope_es_estimado = datos.escala_estimada(recat)
+    tope_proyectado = escala_proy.get(cat) if escala_proy else None
+
+    # Inflación del semestre que define la actualización de escala de `recat`
+    tasas_ok = [t for t in (datos.tasa_mes(m) for m in semestre_previo(recat)) if t is not None]
     infl_est = inflacion_compuesta(tasas_ok) if tasas_ok else None
-    tope_proyectado = tope_actual * (1.0 + infl_est) if (tope_actual and infl_est is not None) else None
 
     margen_actual = (tope_actual - ya_facturado) if tope_actual is not None else None
     margen_proyectado = (tope_proyectado - ya_facturado) if tope_proyectado is not None else None
     n_rest = len(meses_restantes)
 
     return {
-        "recat_proxima": prox,
+        "recat": recat,
         "categoria_meta": cat,
-        "meses_ventana": meses_prox,
+        "meses_ventana": meses_ventana,
         "ya_facturado": ya_facturado,
         "meses_restantes": meses_restantes,
         "tope_actual": tope_actual,
         "inflacion_estimada_semestre": infl_est,
         "tope_proyectado": tope_proyectado,
+        "tope_es_estimado": tope_es_estimado,
         "margen_actual": margen_actual,
         "margen_proyectado": margen_proyectado,
         "promedio_mensual_actual": margen_actual / n_rest if (margen_actual is not None and n_rest) else None,
